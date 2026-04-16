@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  ai-service:
+    build: .
+    container_name: ai-service
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    networks:
+      - backend
+
+networks:
+  backend:
+    external: true
