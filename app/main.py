@@ -70,7 +70,7 @@ def root():
 @app.post("/detect")
 async def detect(image_url: str):
     """Phân tích ảnh (không có text)"""
-    result = await ai_service.analyze_image_only(image_url)
+    result = ai_service.analyze_image_only(image_url)
     return {"detections": result}
 
 
@@ -80,7 +80,7 @@ async def analyze(image_url: str, title: str = None):
     if title:
         result = ai_service.analyze(image_url, title)
     else:
-        result = await ai_service.analyze_image_only(image_url)
+        result = ai_service.analyze_image_only(image_url)
     return result
 
 

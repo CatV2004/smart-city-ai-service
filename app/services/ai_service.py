@@ -45,44 +45,70 @@ class AIService:
             raise ValueError("Failed to decode image")
         return image
     
-    def fuse_predictions(
-        self, 
-        yolo_detections: List[Dict], 
-        text_result: Dict
-    ) -> Dict:
-        """Kết hợp kết quả từ YOLO và Text Classifier"""
-        
-        # Khởi tạo scores
+    def fuse_predictions(self, yolo_detections, text_result):
+
         class_scores = {cls: 0.0 for cls in self.class_names}
-        
-        # Từ YOLO
+
+        # ----------------------
+        # YOLO → MAX aggregation
+        # ----------------------
+        yolo_max_scores = {}
+
         for det in yolo_detections:
             label = det.get("label")
             conf = det.get("confidence", 0)
+
+            if label not in yolo_max_scores:
+                yolo_max_scores[label] = conf
+            else:
+                yolo_max_scores[label] = max(yolo_max_scores[label], conf)
+
+        for label, conf in yolo_max_scores.items():
             if label in class_scores:
-                class_scores[label] += conf * self.yolo_weight
-        
-        # Từ Text
-        text_label = text_result["label"]
-        text_conf = text_result["confidence"]
-        if text_label in class_scores:
-            class_scores[text_label] += text_conf * self.text_weight
-        
-        # Tìm label tốt nhất
+                class_scores[label] = conf * self.yolo_weight
+
+        # ----------------------
+        # TEXT → top-K fusion
+        # ----------------------
+        text_predictions = text_result.get("top_predictions", [])
+
+        for pred in text_predictions:
+            label = pred["label"]
+            conf = pred["confidence"]
+
+            if label in class_scores:
+                class_scores[label] += conf * self.text_weight
+
+        # ----------------------
+        # BEST LABEL
+        # ----------------------
         best_label = max(class_scores, key=class_scores.get)
         best_conf = class_scores[best_label]
-        
-        # Chuẩn hóa confidence
-        max_possible = self.yolo_weight * max(1, len(yolo_detections)) + self.text_weight
-        best_conf = min(best_conf / max_possible, 1.0)
-        
-        # Top predictions
-        sorted_scores = sorted(class_scores.items(), key=lambda x: x[1], reverse=True)
+
+        # ----------------------
+        # NORMALIZATION (optional)
+        # ----------------------
+        best_conf = min(best_conf, 1.0)
+
+        # ----------------------
+        # TOP-K
+        # ----------------------
+        sorted_scores = sorted(
+            class_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
         top_predictions = [
-            {"label": label, "label_vi": self.label_vi.get(label, label), "confidence": min(score, 1.0)}
-            for label, score in sorted_scores[:3] if score > 0
+            {
+                "label": label,
+                "label_vi": self.label_vi.get(label, label),
+                "confidence": score
+            }
+            for label, score in sorted_scores[:3]
+            if score > 0
         ]
-        
+
         return {
             "label": best_label,
             "label_vi": self.label_vi.get(best_label, best_label),
@@ -93,26 +119,50 @@ class AIService:
     
     def analyze_image_only(self, image_url: str) -> Dict:
         """Phân tích chỉ ảnh (không có text)"""
+
         image = self.download_image(image_url)
-        detections = self.yolo_predictor.predict(image)
-        
+
+        image_result = self.yolo_predictor.predict(image)
+
+        detections = image_result["detections"]
+        top_predictions = image_result["top_predictions"]
+        prediction = image_result["prediction"]
+
         if not detections:
             return {
                 "status": "no_detections",
                 "detections": [],
+                "top_predictions": [],
                 "message": "Không phát hiện vấn đề trong ảnh"
             }
-        
-        best_det = max(detections, key=lambda x: x["confidence"])
-        
+
         return {
             "status": "success",
+
+            # detection objects từ YOLO
             "detections": detections,
+
+            # top-K labels để phục vụ fusion
+            "top_predictions": [
+                {
+                    "label": pred["label"],
+                    "label_vi": self.label_vi.get(
+                        pred["label"],
+                        pred["label"]
+                    ),
+                    "confidence": pred["confidence"]
+                }
+                for pred in top_predictions
+            ],
+
+            # prediction tốt nhất
             "best_detection": {
-                "label": best_det["label"],
-                "label_vi": self.label_vi.get(best_det["label"], best_det["label"]),
-                "confidence": best_det["confidence"],
-                "bbox": best_det["bbox"]
+                "label": prediction["label"],
+                "label_vi": self.label_vi.get(
+                    prediction["label"],
+                    prediction["label"]
+                ),
+                "confidence": prediction["confidence"]
             }
         }
     
@@ -133,46 +183,74 @@ class AIService:
     
     def analyze(self, image_url: str, title: str) -> Dict:
         """
-        Phân tích đầy đủ: Ảnh + Text
+        Phân tích đầy đủ: Ảnh + Text (Multimodal Fusion)
         """
         try:
             # 1. Tải ảnh
             image = self.download_image(image_url)
-            
-            # 2. YOLO Detection
-            yolo_detections = self.yolo_predictor.predict(image)
-            logger.info(f"YOLO detected {len(yolo_detections)} objects")
-            
-            # 3. Text Classification
-            text_result = self.text_classifier.predict(title, return_all_probs=True)
-            logger.info(f"Text classified as: {text_result['label_vi']} (conf: {text_result['confidence']:.3f})")
-            
-            # 4. Fusion
-            if yolo_detections:
-                fusion_result = self.fuse_predictions(yolo_detections, text_result)
+
+            # 2. YOLO Prediction (UPDATED CONTRACT)
+            image_result = self.yolo_predictor.predict(image)
+
+            yolo_detections = image_result["detections"]
+            yolo_top_predictions = image_result["top_predictions"]
+
+            logger.info(
+                f"YOLO detected {len(yolo_detections)} objects"
+            )
+
+            # 3. Text Classification (PhoBERT)
+            text_result = self.text_classifier.predict(
+                title,
+                return_all_probs=True
+            )
+
+            logger.info(
+                f"Text classified as: {text_result['label_vi']} "
+                f"(conf: {text_result['confidence']:.3f})"
+            )
+
+            # 4. Fusion (UPDATED INPUT)
+            if yolo_top_predictions:
+                fusion_result = self.fuse_predictions(
+                    yolo_top_predictions,
+                    text_result
+                )
             else:
                 fusion_result = {
                     "label": text_result["label"],
                     "label_vi": text_result["label_vi"],
                     "confidence": text_result["confidence"] * self.text_weight,
                     "top_predictions": text_result.get("top_predictions", []),
-                    "scores": {text_result["label"]: text_result["confidence"]}
+                    "scores": {
+                        text_result["label"]: text_result["confidence"]
+                    }
                 }
-            
+
+            # 5. Return unified response
             return {
                 "status": "success",
                 "image_url": image_url,
                 "title": title,
+
+                # raw YOLO outputs (for explainability)
                 "yolo_detections": yolo_detections,
+
+                # image-level predictions (IMPORTANT for fusion)
+                "yolo_top_predictions": yolo_top_predictions,
+
+                # text model output
                 "text_classification": {
                     "label": text_result["label"],
                     "label_vi": text_result["label_vi"],
                     "confidence": text_result["confidence"],
                     "top_predictions": text_result.get("top_predictions", [])
                 },
+
+                # final multimodal decision
                 "final_prediction": fusion_result
             }
-            
+
         except Exception as e:
             logger.error(f"Error analyzing: {e}")
             return {

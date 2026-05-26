@@ -55,7 +55,7 @@ def handle_report_created(event: dict):
         "description": message.description,
         "category": message.category,
         "address": message.address,
-        "created_at": message.createdAt.isoformat() if message.createdAt else None
+        # "created_at": message.createdAt.isoformat() if message.createdAt else None
     }
     
     success = redis_service.save_pending_report(str(message.reportId), report_data)
@@ -71,101 +71,188 @@ def handle_report_attachments(event: dict):
     except Exception as e:
         logger.error(f"❌ Failed to parse ReportAttachmentsAddedMessage: {e}")
         return
-    
-    logger.info(f"🖼️ Processing attachments for report {message.reportId}")
-    logger.info(f"   Attachments: {len(message.attachmentUrls)} images")
 
-    # Lấy title từ Redis
+    logger.info(
+        f"🖼️ Processing attachments for report {message.reportId}"
+    )
+    logger.info(
+        f"   Attachments: {len(message.attachmentUrls)} images"
+    )
+
+    # --------------------------------------------------
+    # Get pending report info from Redis
+    # --------------------------------------------------
     report_id_str = str(message.reportId)
     pending_info = redis_service.get_pending_report(report_id_str)
-    
+
     title = ""
-    
+
     if pending_info:
         title = pending_info.get("title", "")
-        logger.info(f"   📥 Retrieved from Redis: title='{title[:50] if title else ''}...'")
+        logger.info(
+            f"   📥 Retrieved from Redis: "
+            f"title='{title[:50] if title else ''}...'"
+        )
     else:
-        logger.warning(f"   ⚠️ No pending data found in Redis for report {message.reportId}")
+        logger.warning(
+            f"   ⚠️ No pending data found in Redis "
+            f"for report {message.reportId}"
+        )
 
+    # --------------------------------------------------
+    # Collect image-level predictions only
+    # --------------------------------------------------
     all_predictions = []
-    
+
     for idx, image_url in enumerate(message.attachmentUrls):
+
         try:
-            logger.info(f"   🖼️ Analyzing image {idx+1}/{len(message.attachmentUrls)}: {image_url[:80]}...")
-            
+            logger.info(
+                f"   🖼️ Analyzing image "
+                f"{idx+1}/{len(message.attachmentUrls)}"
+            )
+
+            # ==================================================
+            # CASE 1: Multimodal Fusion (Image + Text)
+            # ==================================================
             if title:
+
                 result = analyze_with_retry(image_url, title)
-                
-                if result.get("status") == "success":
-                    final_pred = result.get("final_prediction", {})
-                    if final_pred:
-                        all_predictions.append({
-                            "label": final_pred.get("label"),
-                            "confidence": final_pred.get("confidence"),
-                            "label_vi": final_pred.get("label_vi"),
-                            "source": "fusion"
-                        })
-                        logger.info(f"      ✅ Fusion: {final_pred.get('label_vi')} ({final_pred.get('confidence'):.3f})")
-                    
-                    for det in result.get("yolo_detections", []):
-                        all_predictions.append({
-                            "label": det.get("label"),
-                            "confidence": det.get("confidence"),
-                            "bbox": det.get("bbox"),
-                            "source": "yolo"
-                        })
+                logger.info(
+                    f"   🔍 Multimodal analysis result: {result}")
+
+                if result.get("status") != "success":
+                    continue
+
+                final_pred = result.get("final_prediction")
+                logger.info(f"   🔍 Multimodal analysis final_pred: {final_pred}")
+
+                if final_pred:
+
+                    all_predictions.append(
+                        Prediction(
+                            label=final_pred.get("label"),
+                            confidence=final_pred.get("confidence")
+                        )
+                    )
+
+                    logger.info(
+                        f"✅ Fusion Final: "
+                        f"{final_pred.get('label_vi')} "
+                        f"({final_pred.get('confidence'):.3f})"
+                    )
+
+            # ==================================================
+            # CASE 2: Image Only
+            # ==================================================
             else:
+
                 result = analyze_with_retry(image_url)
-                
-                if result.get("status") == "success":
-                    for det in result.get("detections", []):
-                        all_predictions.append({
-                            "label": det.get("label"),
-                            "confidence": det.get("confidence"),
-                            "bbox": det.get("bbox"),
-                            "source": "yolo"
-                        })
-                        logger.info(f"      ✅ YOLO: {det.get('label')} ({det.get('confidence'):.3f})")
-                        
+
+                if result.get("status") != "success":
+                    continue
+
+                yolo_top_predictions = result.get(
+                    "top_predictions",
+                    []
+                )
+
+                for pred in yolo_top_predictions:
+
+                    all_predictions.append(
+                        Prediction(
+                            label=pred.get("label"),
+                            confidence=pred.get("confidence")
+                        )
+                    )
+
+                    logger.info(
+                        f"✅ YOLO Image-Level: "
+                        f"{pred.get('label_vi', pred.get('label'))} "
+                        f"({pred.get('confidence'):.3f})"
+                    )
+
         except Exception as e:
-            logger.error(f"   ❌ Failed to analyze {image_url}: {e}")
+            logger.error(
+                f"   ❌ Failed to analyze {image_url}: {e}"
+            )
 
+    # --------------------------------------------------
+    # Cleanup Redis
+    # --------------------------------------------------
     redis_service.delete_pending_report(report_id_str)
-    logger.info(f"   🗑️ Removed pending report from Redis")
 
+    logger.info(
+        f"   🗑️ Removed pending report from Redis"
+    )
+
+    # --------------------------------------------------
+    # No prediction
+    # --------------------------------------------------
     if not all_predictions:
-        logger.info(f"📭 No predictions for report {message.reportId}")
-        
+
+        logger.info(
+            f"📭 No predictions for report {message.reportId}"
+        )
+
         ai_message = ReportAIAnalyzedMessage(
             type="ReportAIAnalyzedMessage",
             reportId=message.reportId,
             predictions=[]
         )
+
+    # --------------------------------------------------
+    # Aggregate report-level predictions
+    # --------------------------------------------------
     else:
+
         best_by_label = {}
+
         for pred in all_predictions:
-            label = pred["label"]
-            if label not in best_by_label or pred["confidence"] > best_by_label[label].confidence:
-                best_by_label[label] = Prediction(
-                    label=label,
-                    confidence=pred["confidence"]
-                )
-        
-        sorted_preds = sorted(best_by_label.values(), key=lambda x: x.confidence, reverse=True)
+
+            label = pred.label
+
+            if (
+                label not in best_by_label
+                or pred.confidence > best_by_label[label].confidence
+            ):
+                best_by_label[label] = pred
+
+        # sort descending confidence
+        sorted_preds = sorted(
+            best_by_label.values(),
+            key=lambda x: x.confidence,
+            reverse=True
+        )
+
         top_predictions = sorted_preds[:3]
-        
+
         ai_message = ReportAIAnalyzedMessage(
             type="ReportAIAnalyzedMessage",
             reportId=message.reportId,
             predictions=top_predictions
         )
-        
-        logger.info(f"📊 Final predictions for report {message.reportId}:")
-        for pred in top_predictions:
-            logger.info(f"      - {pred.label}: {pred.confidence:.3f}")
 
+        logger.info(
+            f"📊 Final predictions for report "
+            f"{message.reportId}:"
+        )
+
+        for pred in top_predictions:
+            logger.info(
+                f"      - {pred.label}: "
+                f"{pred.confidence:.3f}"
+            )
+
+    # --------------------------------------------------
+    # Publish result
+    # --------------------------------------------------
     publish_ai_result(ai_message.model_dump())
-    logger.info(f"📤 Published AI result for report {message.reportId}")
+
+    logger.info(
+        f"📤 Published AI result for report "
+        f"{message.reportId}"
+    )
 
 
 def process_message(msg: KafkaMessage) -> bool:
